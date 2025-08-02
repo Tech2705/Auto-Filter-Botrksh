@@ -2,8 +2,8 @@ pyrofork==2.3.45
 tgcrypto
 pymongo[srv]>=3.12
 motor>=3.6
+marshmallow==2.21.0
 umongo==2.1.0
-marshmallow==3.19.0
 pytz
 git+https://github.com/Joelkb/cinemagoer
 shortzy
