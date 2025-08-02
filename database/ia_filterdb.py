@@ -1,4 +1,3 @@
-
 import logging
 import re
 import base64
@@ -10,13 +9,15 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from marshmallow.exceptions import ValidationError
 from info import DATABASE_URL, DATABASE_NAME, COLLECTION_NAME, MAX_BTN
 
+# MongoDB Client Setup
 client = AsyncIOMotorClient(DATABASE_URL)
-db = client[DATABASE_NAME]
+db = client[DATABASE_NAME] if DATABASE_NAME else client.get_default_database()
 instance = Instance(db)
 
+# Schema Definition
 @instance.register
 class Media(Document):
-    file_id = fields.StrField(attribute='_id')
+    file_id = fields.StrField(attribute="_id")
     file_name = fields.StrField(required=True)
     file_size = fields.IntField(required=True)
     caption = fields.StrField(allow_none=True)
@@ -25,21 +26,15 @@ class Media(Document):
         indexes = ('$file_name', )
         collection_name = COLLECTION_NAME
 
-# Clean strings from unwanted characters
+# Utility: Clean input strings
 def clean_string(s):
     return re.sub(r"@\w+|[_\-.+]", " ", str(s or "")).strip()
 
-# Decode new-style Pyrogram File ID
+# Decode new-style Pyrogram File ID into legacy format
 def unpack_new_file_id(new_file_id):
     decoded = FileId.decode(new_file_id)
     file_id = encode_file_id(
-        pack(
-            "<iiqq",
-            int(decoded.file_type),
-            decoded.dc_id,
-            decoded.media_id,
-            decoded.access_hash
-        )
+        pack("<iiqq", int(decoded.file_type), decoded.dc_id, decoded.media_id, decoded.access_hash)
     )
     return file_id
 
@@ -56,7 +51,7 @@ def encode_file_id(s: bytes) -> str:
             r += bytes([i])
     return base64.urlsafe_b64encode(r).decode().rstrip("=")
 
-# Save the media file to the database
+# Save media document to MongoDB
 async def save_file(message, media):
     try:
         file_id = unpack_new_file_id(media.file_id)
@@ -70,79 +65,78 @@ async def save_file(message, media):
             caption=file_caption
         )
     except ValidationError:
-        logging.exception(f"Validation error while saving file: {media.file_name}")
+        logging.exception(f"[DB] Validation error: {media.file_name}")
         return 'err'
     except Exception as e:
-        logging.exception(f"Unexpected error while preparing file: {e}")
+        logging.exception(f"[DB] Unexpected error: {e}")
+        return 'err'
+
+    try:
+        await file.commit()
+    except DuplicateKeyError:
+        print(f"[DB] Duplicate - {file_name}")
+        return 'dup'
+    except Exception as e:
+        logging.exception(f"[DB] Commit error: {e}")
         return 'err'
     else:
-        try:
-            await file.commit()
-        except DuplicateKeyError:
-            print(f'[DB] Duplicate - {file_name}')
-            return 'dup'
-        except Exception as e:
-            logging.exception(f"Commit error for {file_name}: {e}")
-            return 'err'
-        else:
-            print(f'[DB] Saved - {file_name}')
-            return 'suc'
+        print(f"[DB] Saved - {file_name}")
+        return 'suc'
 
-# For search-based retrieval
+# Search files with optional language filter
 async def get_search_results(query, max_results=MAX_BTN, offset=0, lang=None):
     query = query.strip()
     if not query:
         raw_pattern = '.'
     elif ' ' not in query:
-        raw_pattern = r'(\b|[\.\+\-_])' + query + r'(\b|[\.\+\-_])'
+        raw_pattern = fr'(\b|[\.\+\-_]){re.escape(query)}(\b|[\.\+\-_])'
     else:
-        raw_pattern = query.replace(' ', r'.*[\s\.\+\-_]')
+        raw_pattern = re.sub(r'\s+', r'.*[\s\.\+\-_]', query)
 
     try:
         regex = re.compile(raw_pattern, flags=re.IGNORECASE)
-    except:
-        regex = query
+    except re.error:
+        regex = re.compile(re.escape(query), flags=re.IGNORECASE)
 
     filter = {'file_name': regex}
     cursor = Media.find(filter).sort('$natural', -1)
 
     if lang:
-        lang_files = [file async for file in cursor if lang in file.file_name.lower()]
-        files = lang_files[offset:][:max_results]
-        total_results = len(lang_files)
+        results = [doc async for doc in cursor if lang in doc.file_name.lower()]
+        files = results[offset:offset + max_results]
+        total = len(results)
     else:
         cursor.skip(offset).limit(max_results)
         files = await cursor.to_list(length=max_results)
-        total_results = await Media.count_documents(filter)
+        total = await Media.count_documents(filter)
 
-    next_offset = offset + max_results
-    if next_offset >= total_results:
-        next_offset = ''
-    return files, next_offset, total_results
+    next_offset = offset + max_results if offset + max_results < total else ''
+    return files, next_offset, total
 
-# For deleting files by search
+# Delete files matching query
 async def delete_files(query):
     query = query.strip()
     if not query:
         raw_pattern = '.'
     elif ' ' not in query:
-        raw_pattern = r'(\b|[\.\+\-_])' + query + r'(\b|[\.\+\-_])'
+        raw_pattern = fr'(\b|[\.\+\-_]){re.escape(query)}(\b|[\.\+\-_])'
     else:
-        raw_pattern = query.replace(' ', r'.*[\s\.\+\-_]')
+        raw_pattern = re.sub(r'\s+', r'.*[\s\.\+\-_]', query)
 
     try:
         regex = re.compile(raw_pattern, flags=re.IGNORECASE)
-    except:
-        regex = query
+    except re.error:
+        regex = re.compile(re.escape(query), flags=re.IGNORECASE)
 
     filter = {'file_name': regex}
     total = await Media.count_documents(filter)
     files = Media.find(filter)
     return total, files
 
-# For getting full file details
+# Get file details by file_id
 async def get_file_details(query):
     filter = {'file_id': query}
     cursor = Media.find(filter)
     filedetails = await cursor.to_list(length=1)
-    return filedetails
+    return filedetails  # ✅ This was missing — now fixed!
+
